@@ -1,0 +1,166 @@
+Title: Build a data-only Supabase Tic Tac Toe web app with Classic (N×N) and Ultimate modes, offline and online play, client-only logic, and presence-based lifecycle management. [1]
+
+High-level scope and goals:
+- Create a web app with two game modes: Classic and Ultimate, each available in Offline and Online variants, with the server acting purely as a data store and all rules/logic enforced on clients. [1]
+- Classic mode supports N×N grids with N in [3..10] and a win condition length W in [3..N], set via sliders, with X always moving first and parity-derived turns, never stored in the database. [1]
+- Ultimate mode runs on a 9×9 grid partitioned into nine 3×3 local boards, with forced-board routing, local board claims, and a global 3-in-a-row win, all computed and visualized entirely on clients from the grid state, without any ultimate-specific fields persisted. [1]
+- Online play uses a single Supabase table “rooms” to store only neutral state: room_code, mode, classic settings, players[], grid[][], restart_votes, and a reset nonce/match_id; no turn, no next-board, no local wins, and no logs/history. [1]
+- Use Supabase Realtime for two channels: Postgres Changes (room row updates) and Presence (to detect both players being offline for 30 seconds, then immediately delete the room). [1]
+- No authentication; clients determine their role (player vs viewer) locally, and viewers never run input logic or attempt writes. [1]
+
+Core product requirements:
+- Modes:
+  - Classic: N slider for 3..10, W slider bounded to 3..N, parity-derived turns (X first), client checks wins/draws for rows/cols/diagonals, and highlights winning lines. [1]
+  - Ultimate: 9×9 with forced-board routing based on last move, unlock free move when target local board is full/won, compute local winners over each 3×3, compute global winner as 3-in-a-row over local claims, and drive all visuals client-side. [1]
+- Offline:
+  - Hot-seat two-human play with identical logic and UI as online; store nothing on a server; optional local persistence is acceptable but not required. [1]
+- Online:
+  - Rooms created and joined via a 5-character uppercase hex code generated from a cryptographically secure RNG without any sequential patterns, regenerating on collision until unique. [1]
+  - Symbol assignment: creator is X and player, second joiner is O and player, any subsequent joiners are viewers with symbol=none, and X always moves first by parity. [1]
+  - Input-Processing-Output model: players alone send input writes, all clients subscribe to output via Realtime, and processing (rules, wins, visuals) runs locally after each output. [1]
+  - Restart handshake stored in room row as an AND gate on restart_votes.X and restart_votes.O, with idempotent reset guarded by a match_id/reset_nonce increment. [1]
+  - Immediate deletion: when both players are offline for 30 seconds (presence grace), delete the room hard, keep no history, disconnect viewers, and redirect them to main menu. [1]
+
+Non-functional constraints:
+- Data-only server: no game logic on the server; only data storage, Realtime broadcast, presence tracking, and a simple deletion operation are performed. [1]
+- No Supabase role checks or auth; the client enforces roles and input gating; RLS may be disabled or permissive to avoid blocking writes from legitimate clients. [1]
+- Robust against concurrent writes: last-write-wins is acceptable, with client revalidation on output to align with authoritative state. [1]
+
+Supabase setup:
+- Environment:
+  - Use @supabase/supabase-js with project URL and anon key supplied via environment variables, e.g., VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY for frontend builds. [1]
+  - Initialize a single client instance and reuse across services/components, subscribing to Postgres Changes for the rooms table and to a presence channel per room. [1]
+- Database schema (single table):
+  - Table: public.rooms. [1]
+  - Columns:
+    - room_code text primary key: 5-character uppercase hexadecimal code, generated purely at random and regenerated until unique on collision. [1]
+    - mode text: 'classic' or 'ultimate'. [1]
+    - grid_size int nullable: only for classic, in [3..10]. [1]
+    - win_length int nullable: only for classic, in [3..grid_size]. [1]
+    - players jsonb not null: ordered array storing objects {name, status: 'player'|'viewer', symbol: 'X'|'O'|'none', client_id:string}, where creator is index 0 and second player is index 1 if present. [1]
+    - grid text[][] not null: 2D array of "X"|"O"|"" representing the full board (N×N for classic or 9×9 for ultimate). [1]
+    - restart_votes jsonb not null default '{}'::jsonb: keys 'X' and 'O' booleans for restart consent, missing keys interpreted as false. [1]
+    - match_id int not null default 0: incremented only when a reset is applied so clients can ignore stale or duplicate resets. [1]
+    - created_at timestamptz default now(), updated_at timestamptz default now(). [1]
+  - Triggers:
+    - BEFORE UPDATE trigger to set updated_at=now() for change detection and simple optimistic compare if needed. [1]
+  - RLS:
+    - For this project, disable RLS or add permissive policies that allow insert/select/update/delete to all, since there is no auth and the client enforces roles. [1]
+- Realtime:
+  - Postgres Changes: subscribe to 'public:rooms' with an equality filter on room_code to receive row-level updates for the specific room. [1]
+  - Presence:
+    - Create a presence channel named "room-{room_code}" and track only the two players by unique client_id; viewers may join presence but are ignored for lifecycle decisions. [1]
+    - Presence grace window is 30 seconds to tolerate transient disconnects; only when both players are offline for at least 30 seconds should the delete sequence run. [1]
+  - Deletion flow:
+    - Any connected client (player or viewer) who observes via presence that both players have been offline for ≥30 seconds must issue a hard delete of the row public.rooms where room_code=code, and then unsubscribe and redirect to main. [1]
+    - Handle race conditions where multiple clients try to delete: allow last-write-wins; failures can be ignored as success is implied by “not found”. [1]
+
+Room code generation:
+- Generate 5-character uppercase hex strings using a cryptographically secure RNG, mapping 0–15 to 0–9 and A–F, without sequences or counters. [1]
+- On collision (row exists with same room_code), regenerate until unique, which is acceptable given 16^5 = 1,048,576 total combinations. [1]
+- Display codes as plain uppercase with no separators; provide a copy-to-clipboard button. [1]
+
+Client-side architecture:
+- State ownership:
+  - The client holds the active view-model including computed turn based on move parity, legal move masks, ultimate target board constraints, local board claims, and global winner; none of these are stored on the server. [1]
+- Input-Processing-Output loop:
+  - Input:
+    - Only clients whose local role is player can attempt to write; viewers never activate input logic. [1]
+    - Before writing, validate locally: it is the mover by parity (X moves on even count, O on odd), cell is empty, and in ultimate mode the move obeys forced-board constraints derived from the last move and current occupancy. [1]
+    - After sending a move write, immediately block local input until a fresh output (room update) is received. [1]
+  - Output:
+    - Subscribe to the room row, re-render the grid immediately on updates, and keep viewers in sync without any writes. [1]
+  - Processing:
+    - On each output, recompute wins/draw, animate local/global claims for ultimate, highlight classic winning lines, and decide if this client should re-enable input based on role and parity. [1]
+- Restart handshake:
+  - Each player can set their vote in restart_votes; viewers never see controls. [1]
+  - When both votes are true and both players are present, perform a single reset by clearing the grid, incrementing match_id, clearing votes, and continuing parity-derived turns with X first for the new match; symbol “swap” is a UI convention, not a server field. [1]
+  - Ensure the reset write is idempotent by checking match_id and only incrementing once; concurrent attempts that do not bump the nonce are ignored by clients. [1]
+- Leave and deletion:
+  - Explicit leave: remove the departing client from players[] if present; if after the update both players are absent, delete the room immediately. [1]
+  - Unclean exit: rely on presence detection to delete the room once both players are offline for ≥30 seconds, even if no explicit leave occurred. [1]
+  - After deletion, all clients (including viewers) should auto-disconnect and be redirected to main menu with a toast “Room ended”. [1]
+
+UI/UX requirements:
+- Screens:
+  - Main menu: Offline and Online tabs with Classic and Ultimate entries, and inputs to Create or Join by room code. [1]
+  - Online create: nickname input, mode selector, classic sliders N and W, and a “Create room” button; show room code with copy action and share prompt. [1]
+  - Online join: nickname input and room code field; upon join, immediately render the board view; if players already filled, join as viewer. [1]
+  - Board view: unified component that renders classic or ultimate grid; shows player names with symbols, move parity indicator, viewer badge, and restart/leave controls only for players. [1]
+  - End state: upon win/draw, show modal: “Restart” and “Leave” for players; viewers see a non-interactive banner; disable all input until reset or exit. [1]
+- Controls:
+  - Classic sliders: N in 3..10, W in 3..N; when N changes and W> N, clamp W to N; changing either resets the local board in Offline and is persisted in the new-room payload for Online. [1]
+- Visuals:
+  - Classic win lines highlighted; draw state shows a neutral overlay. [1]
+  - Ultimate: emphasize the forced target local board; overlay large X/O for claimed locals; gray-out boards unavailable by routing unless unlocked by full/won condition; compute all visuals client-side. [1]
+- Input gating:
+  - Show “Your turn” only when role=player and computed parity matches symbol; otherwise show “Opponent’s turn” or “Spectating”; disable pointer events when not allowed. [1]
+
+Database interactions:
+- Create room:
+  - Generate random 5-char uppercase hex code; check for collision by attempting an insert; on conflict, regenerate and retry. [1]
+  - Insert a row with: room_code, mode, grid_size/win_length (classic), players=[{name,status:'player',symbol:'X',client_id}], grid initialized empty, restart_votes={}, match_id=0. [1]
+- Join room:
+  - Fetch row by room_code; if exactly one player present with symbol X, add second player as symbol O; else append as viewer with symbol none; update players in-place. [1]
+  - Subscribe to changes and presence immediately after join. [1]
+- Make move:
+  - Clients write a patched grid[][] where exactly one empty cell becomes X or O; turn is not a server field, so no need to patch anything else; all validation is client-side prior to write. [1]
+  - Resolve collisions by last-write-wins; on output, clients re-render and accept the authoritative state. [1]
+- Restart votes:
+  - Update restart_votes.{X|O}=true for the voting player; when reading output, if both true and two players present, perform one reset write: clear grid to empty, increment match_id, and set restart_votes to false/empty object. [1]
+- Leave:
+  - Update players[] to remove departing client; if after update there are zero players with status='player', immediately delete the row. [1]
+- Delete:
+  - Hard delete public.rooms where room_code=code; no soft-deletes or history; on “not found”, treat as success. [1]
+
+Realtime handling:
+- Postgres Changes:
+  - Subscribe to 'public:rooms' with filter room_code=eq.CODE; on any insert/update/delete for that row, update the local state or redirect if deleted. [1]
+- Presence:
+  - Join channel "room-CODE" with presence payload {client_id, role: 'player'|'viewer', symbol}; heartbeat interval per Supabase defaults; maintain a client timer that checks both players’ last-seen timestamps. [1]
+  - If both players absent for ≥30 seconds, any client issues the delete; after receiving delete output, all clients redirect to main menu. [1]
+
+Game rules (client-computed):
+- Classic:
+  - Win detection: check all rows, columns, diagonals, anti-diagonals for length W contiguous identical symbols; if none and grid is full, it is a draw. [1]
+  - Turn: derived by counting non-empty cells; even count = X’s turn, odd count = O’s turn. [1]
+- Ultimate:
+  - Routing: the destination local board is set by the small-cell coordinates of the last move; if that destination board is full or claimed, the next player may play anywhere. [1]
+  - Local winners: for each 3×3 block, compute 3-in-a-row; a draw in the local board does not produce a claim; a claim renders a big X/O overlay. [1]
+  - Global winner: compute 3-in-a-row over the 3×3 matrix of claimed locals; the game ends when a global winner is found or when the entire 9×9 is full without a global winner (draw). [1]
+
+Edge cases and concurrency:
+- Simultaneous moves: two players may attempt to move at the same time; server uses last-write-wins; on output, both clients re-render; the client whose move lost the race simply proceeds from the authoritative state. [1]
+- Out-of-turn or illegal moves: clients block these locally and do not send writes; if an illegal write somehow occurs, later outputs overwrite the local speculative state. [1]
+- Restart races: both clients may try to reset; guard with match_id so only the first write is recognized; others observe the increment and avoid a second reset. [1]
+- Disconnects and reconnection:
+  - Short blips under 30 seconds are ignored by presence and do not delete rooms; after 30 seconds with zero players online, delete immediately. [1]
+  - On reconnect after deletion, “room not found” should route to main with a clear message. [1]
+- Viewers:
+  - Viewers never block deletion; the presence/liveness of players exclusively controls lifecycle; viewers are disconnected and redirected after deletion. [1]
+- Room codes:
+  - Handle collisions by regenerating; never use sequential or predictable patterns; ensure codes are uppercase hexadecimal displayed plainly. [1]
+
+Testing checklist:
+- Classic:
+  - For each N in 3..10 and W in 3..N, verify correct win lines for all directions and draw detection when full. [1]
+- Ultimate:
+  - Validate routing, unlock when target is full/won, accurate local claims, and correct global winner detection; ensure visuals reflect computed states. [1]
+- Online:
+  - Verify role assignment (X creator, O second, others viewers), input gating after write until output, restart handshake and idempotent reset, presence-based immediate deletion after 30 seconds, and viewer redirect after deletion. [1]
+- Races:
+  - Simulate simultaneous moves and resets; confirm last-write-wins resolution and idempotency via match_id and client revalidation on output. [1]
+
+Deliverables:
+- A production-ready web app with:
+  - Fully implemented Offline and Online Classic and Ultimate modes with the specified UX. [1]
+  - Supabase schema, triggers, and Realtime subscriptions configured as above. [1]
+  - Presence-driven immediate deletion and viewer redirect. [1]
+  - Code organized into services/modules for Supabase, presence, game logic, and UI components. [1]
+- Documentation embedded in code and a brief README explaining environment variables and how to run locally. [1]
+
+Explicit constraints recap:
+- No server-side logic beyond CRUD, Realtime, presence, and deletion; all rules are computed client-side. [1]
+- No authentication; roles are enforced purely on the client and not by Supabase policies. [1]
+- No logs/history; rooms are hard-deleted when both players leave or are offline for ≥30 seconds. [1]
+- Room codes are 5-character uppercase hexadecimal, purely random, with collision regeneration until unique. [1]

@@ -239,6 +239,16 @@ export class UltimateGameLogic {
       return false;
     }
     
+    // Check if the local board containing this cell is already concluded
+    const cellLocalBoard = this.getLocalBoardIndex(row, col);
+    const localWinner = this.checkLocalWinner(grid, cellLocalBoard);
+    const isLocalBoardFull = this.isLocalBoardFull(grid, cellLocalBoard);
+    
+    // Cannot play in a local board that is won or drawn (full)
+    if (localWinner !== null || isLocalBoardFull) {
+      return false;
+    }
+    
     // If no target board restriction, any empty cell is valid
     if (targetBoard === null) {
       return true;
